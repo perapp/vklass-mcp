@@ -1,8 +1,12 @@
+import pytest
+
 from vklass_mcp.parsers import (
     normalize_calendar_events,
+    normalize_care_schedule,
     normalize_news_item,
     parse_account_identity,
     parse_children,
+    parse_children_authoritative,
     parse_study_courses,
     parse_weekly_reports,
 )
@@ -52,6 +56,16 @@ def test_children_are_extracted_and_enriched_with_meal() -> None:
     ]
 
 
+def test_authoritative_child_list_requires_valid_embedded_payload() -> None:
+    empty = """<script>enhanceServerHtml('absence-notify',
+      'common/views/absence/absence-notify',
+      '{"studentOptions":[]}')</script>"""
+    assert parse_children_authoritative(empty) == ([], True)
+
+    partial = "<html><h1>Frånvaro</h1></html>"
+    assert parse_children_authoritative(partial) == ([], False)
+
+
 def test_calendar_assignment_event_type_two() -> None:
     records = normalize_calendar_events(
         [
@@ -67,6 +81,89 @@ def test_calendar_assignment_event_type_two() -> None:
     )
     assert records[0]["kind"] == "assignment"
     assert records[0]["child_id"] == "123"
+
+
+def test_care_schedule_is_normalized_without_internal_ids() -> None:
+    records = normalize_care_schedule(
+        {
+            "fromDate": "2026-08-24",
+            "untilDate": "2026-08-26",
+            "scheduleData": [
+                {
+                    "studentId": 123,
+                    "schoolId": 456,
+                    "date": "2026-08-24",
+                    "startTime": "07:30",
+                    "endTime": "16:00",
+                    "dropOffTime": "07:42:00",
+                    "pickUpTime": None,
+                    "isOnLeave": "false",
+                    "message": "Hämtas av <b>morfar</b>",
+                    "deviationDayCustodianId": 999,
+                },
+                {
+                    "studentId": 123,
+                    "schoolId": 456,
+                    "date": "2026-08-25",
+                    "startTime": None,
+                    "endTime": None,
+                    "isOnLeave": False,
+                },
+                {
+                    "studentId": 123,
+                    "schoolId": 456,
+                    "date": "2026-08-26",
+                    "startTime": None,
+                    "endTime": None,
+                    "isOnLeave": False,
+                },
+            ],
+            "schoolClosedData": {"456": ["2026-08-26"]},
+        }
+    )
+
+    assert len(records) == 2
+    scheduled = records[0]
+    assert scheduled["kind"] == "care_schedule"
+    assert scheduled["child_id"] == "123"
+    assert scheduled["start_at"] == "2026-08-24T05:30:00+00:00"
+    assert scheduled["end_at"] == "2026-08-24T14:00:00+00:00"
+    assert scheduled["data"] == {
+        "date": "2026-08-24",
+        "planned_start_time": "07:30",
+        "planned_end_time": "16:00",
+        "actual_drop_off_time": "07:42",
+        "actual_pick_up_time": None,
+        "is_on_leave": False,
+        "school_closed": False,
+        "school_holiday": False,
+        "absence_start": None,
+        "absence_end": None,
+        "message": "Hämtas av\nmorfar",
+    }
+    assert "schoolId" not in scheduled["data"]
+    assert records[1]["data"]["school_closed"] is True
+
+
+def test_care_schedule_rejects_non_exact_or_out_of_window_dates() -> None:
+    base = {
+        "fromDate": "2026-08-24",
+        "untilDate": "2026-08-26",
+        "scheduleData": [
+            {
+                "studentId": 123,
+                "schoolId": 456,
+                "date": "2026-08-24T08:00:00",
+                "isOnLeave": False,
+            }
+        ],
+    }
+    with pytest.raises(ValueError):
+        normalize_care_schedule(base)
+
+    base["scheduleData"][0]["date"] = "2026-08-27"
+    with pytest.raises(ValueError):
+        normalize_care_schedule(base)
 
 
 def test_study_courses_parser() -> None:

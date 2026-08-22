@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import date, datetime
 from http.cookies import SimpleCookie
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -55,7 +55,7 @@ class VklassClient:
             headers={
                 "Accept": "*/*",
                 "Accept-Language": "sv-SE,sv;q=0.9,en;q=0.7",
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) VklassMCP/0.1",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) VklassMCP/0.3",
             },
         )
 
@@ -142,6 +142,13 @@ class VklassClient:
     async def scoreboard(self) -> Any:
         return await self.get_json("/Account/Scoreboard")
 
+    async def care_schedule(self, from_date: date) -> Any:
+        return await self.get_json(
+            "/CareSchedule/LoadDays",
+            params={"fromDate": from_date.isoformat()},
+            headers={"vk-json-load": "true"},
+        )
+
     async def study_overview(self) -> str:
         return await self.get_text("/StudyOverview/Student")
 
@@ -197,8 +204,9 @@ class VklassClient:
         path: str,
         *,
         params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
-        _, body = await self._request("GET", path, params=params)
+        _, body = await self._request("GET", path, params=params, headers=headers)
         try:
             return json.loads(body)
         except json.JSONDecodeError as error:

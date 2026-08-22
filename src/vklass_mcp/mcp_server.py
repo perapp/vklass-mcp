@@ -171,6 +171,31 @@ def register_tools(mcp: FastMCP[Any], registry: UserRegistry) -> None:
         return [_public_record(record, preview=False) for record in records]
 
     @mcp.tool(annotations=_READ_ONLY)
+    async def vklass_list_care_schedule(
+        child: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """List cached omsorgsschema with planned care and actual drop-off/pick-up times."""
+
+        service = await _current_service(registry)
+        child_id = await _resolve_child(service, child)
+        local_today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+        start_at = _normalize_date(start or local_today.isoformat())
+        end_at = _normalize_date(
+            end or (local_today + timedelta(days=14)).isoformat(), end_of_day=True
+        )
+        records = await service.store.query_records(
+            kinds=["care_schedule"],
+            child_id=child_id,
+            start_at=start_at,
+            end_at=end_at,
+            limit=limit,
+        )
+        return [_public_record(record, preview=False) for record in records]
+
+    @mcp.tool(annotations=_READ_ONLY)
     async def vklass_list_automatic_weekly_reports(
         child: str | None = None,
         limit: int = 20,
@@ -249,6 +274,7 @@ def register_tools(mcp: FastMCP[Any], registry: UserRegistry) -> None:
             "assignment",
             "calendar",
             "weekly_report",
+            "care_schedule",
             "meal",
             "home",
             "absence",

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
 from collections.abc import Iterable
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from html import unescape
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -111,6 +112,32 @@ def parse_children(absence_html: str, home_html: str = "") -> list[dict[str, Any
                 child["meal"] = card_data["meal"]
                 break
     return sorted(found.values(), key=lambda item: str(item.get("name", "")))
+
+
+def parse_children_authoritative(
+    absence_html: str, home_html: str = ""
+) -> tuple[list[dict[str, Any]], bool]:
+    """Parse wards and report whether an explicit Vklass ward list was validated."""
+
+    children = parse_children(absence_html, home_html)
+    payload = _aurelia_payload(
+        absence_html,
+        component="absence-notify",
+        view="common/views/absence/absence-notify",
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("studentOptions"), list):
+        return children, False
+    expected_ids: set[str] = set()
+    for item in payload["studentOptions"]:
+        if not isinstance(item, dict):
+            return children, False
+        child_id = str(item.get("value") or "").strip()
+        full_name = str(item.get("fullName") or "").strip()
+        if not child_id.isdigit() or not full_name:
+            return children, False
+        expected_ids.add(child_id)
+    actual_ids = {str(child["id"]) for child in children}
+    return children, actual_ids == expected_ids
 
 
 def normalize_news_items(payload: Any) -> tuple[list[dict[str, Any]], str | None]:
@@ -230,6 +257,136 @@ def normalize_calendar_events(payload: Any, child_id: str) -> list[dict[str, Any
     return records
 
 
+def validate_care_schedule_payload(payload: Any) -> None:
+    """Reject schema drift before an authoritative care-schedule cache replacement."""
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("scheduleData"), list):
+        raise ValueError("care schedule response had an unexpected schema")
+    response_start = _care_date(payload.get("fromDate"))
+    response_end = _care_date(payload.get("untilDate"))
+    if not response_start or not response_end or response_end < response_start:
+        raise ValueError("care schedule response had an invalid date window")
+    for item in payload["scheduleData"]:
+        if not isinstance(item, dict):
+            raise ValueError("care schedule response contained an invalid day")
+        child_id = str(item.get("studentId") or "").strip()
+        school_id = str(item.get("schoolId") or "").strip()
+        schedule_date = _care_date(item.get("date"))
+        if not child_id or not school_id or not schedule_date:
+            raise ValueError("care schedule response contained an invalid day identity")
+        if not response_start <= schedule_date <= response_end:
+            raise ValueError("care schedule response contained a day outside its date window")
+        for key in ("startTime", "endTime", "dropOffTime", "pickUpTime"):
+            if item.get(key) not in (None, "") and _care_time(item[key]) is None:
+                raise ValueError("care schedule response contained an invalid time")
+        for key in ("absenceStart", "absenceEnd"):
+            if item.get(key) not in (None, "") and _care_date(item[key]) is None:
+                raise ValueError("care schedule response contained an invalid absence date")
+        if not _is_care_bool(item.get("isOnLeave")):
+            raise ValueError("care schedule response contained an invalid leave value")
+    for key in ("schoolClosedData", "schoolHolidayData"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise ValueError("care schedule response contained invalid closure data")
+        for dates in value.values():
+            if not isinstance(dates, list) or any(_care_date(item) is None for item in dates):
+                raise ValueError("care schedule response contained invalid closure dates")
+
+
+def normalize_care_schedule(payload: Any) -> list[dict[str, Any]]:
+    """Normalize the read-only care schedule returned by ``CareSchedule/LoadDays``."""
+
+    validate_care_schedule_payload(payload)
+    closed_dates = _dates_by_school(payload.get("schoolClosedData"))
+    holiday_dates = _dates_by_school(payload.get("schoolHolidayData"))
+    records: list[dict[str, Any]] = []
+    for item in payload["scheduleData"]:
+        if not isinstance(item, dict):
+            continue
+        child_id = str(item.get("studentId") or "").strip()
+        school_id = str(item.get("schoolId") or "").strip()
+        schedule_date = str(item.get("date") or "").strip()
+        if not child_id or not school_id or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", schedule_date):
+            continue
+        try:
+            date.fromisoformat(schedule_date)
+        except ValueError:
+            continue
+
+        start_time = _care_time(item.get("startTime"))
+        end_time = _care_time(item.get("endTime"))
+        drop_off_time = _care_time(item.get("dropOffTime"))
+        pick_up_time = _care_time(item.get("pickUpTime"))
+        message = plain_text(item.get("message"), 1000)
+        is_on_leave = _care_bool(item.get("isOnLeave"))
+        school_closed = schedule_date in closed_dates.get(school_id, set())
+        school_holiday = schedule_date in holiday_dates.get(school_id, set())
+        absence_start = _care_date(item.get("absenceStart"))
+        absence_end = _care_date(item.get("absenceEnd"))
+        if not any(
+            (
+                start_time,
+                end_time,
+                drop_off_time,
+                pick_up_time,
+                message,
+                is_on_leave,
+                school_closed,
+                school_holiday,
+                absence_start,
+                absence_end,
+            )
+        ):
+            continue
+
+        details = {
+            "date": schedule_date,
+            "planned_start_time": start_time,
+            "planned_end_time": end_time,
+            "actual_drop_off_time": drop_off_time,
+            "actual_pick_up_time": pick_up_time,
+            "is_on_leave": is_on_leave,
+            "school_closed": school_closed,
+            "school_holiday": school_holiday,
+            "absence_start": absence_start,
+            "absence_end": absence_end,
+            "message": message or None,
+        }
+        body_parts = []
+        if start_time or end_time:
+            body_parts.append(f"Planned care: {start_time or '?'}–{end_time or '?'}")
+        if drop_off_time or pick_up_time:
+            body_parts.append(f"Actual attendance: {drop_off_time or '?'}–{pick_up_time or '?'}")
+        if is_on_leave:
+            body_parts.append("On leave")
+        if school_closed:
+            body_parts.append("Care facility closed")
+        if school_holiday:
+            body_parts.append("School holiday")
+        if message:
+            body_parts.append(message)
+        start_at = _care_datetime(schedule_date, start_time)
+        end_at = _care_datetime(schedule_date, end_time) if end_time else None
+        if end_at and start_time and end_at < start_at:
+            end_at = (datetime.fromisoformat(end_at) + timedelta(days=1)).isoformat()
+        school_digest = hashlib.sha256(school_id.encode()).hexdigest()[:8]
+        records.append(
+            {
+                "kind": "care_schedule",
+                "key": f"{child_id}:{school_digest}:{schedule_date}",
+                "child_id": child_id,
+                "title": "Omsorgsschema",
+                "start_at": start_at,
+                "end_at": end_at,
+                "body_text": "\n".join(body_parts),
+                "data": details,
+            }
+        )
+    return records
+
+
 def parse_study_courses(html: str, child_id: str) -> list[dict[str, Any]]:
     """Extract normalized course/judgement items from the embedded study-overview JSON."""
 
@@ -315,6 +472,31 @@ def is_assignment(record: dict[str, Any]) -> bool:
     )
 
 
+def _aurelia_payload(html: str, *, component: str, view: str) -> Any:
+    soup = BeautifulSoup(html, "html.parser")
+    marker = re.compile(rf"enhanceServerHtml\('{re.escape(component)}',\s*'{re.escape(view)}',\s*")
+    for script in soup.find_all("script"):
+        text = script.string or script.get_text("", strip=False)
+        match = marker.search(text)
+        if not match or match.end() >= len(text) or text[match.end()] != "'":
+            continue
+        start = match.end()
+        escaped = False
+        for index in range(start + 1, len(text)):
+            character = text[index]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == "'":
+                try:
+                    encoded = ast.literal_eval(text[start : index + 1])
+                    return json.loads(encoded)
+                except (SyntaxError, TypeError, ValueError, json.JSONDecodeError):
+                    break
+    return None
+
+
 def _first(mapping: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         value = mapping.get(key)
@@ -338,6 +520,64 @@ def _iso_date(value: Any) -> str | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=ZoneInfo("Europe/Stockholm"))
     return parsed.astimezone(UTC).isoformat()
+
+
+def _care_time(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", str(value).strip())
+    if not match:
+        return None
+    hour, minute = (int(part) for part in match.groups())
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _care_date(value: Any) -> str | None:
+    candidate = str(value or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", candidate):
+        return None
+    try:
+        date.fromisoformat(candidate)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _is_care_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, int):
+        return value in (0, 1)
+    return str(value or "").strip().casefold() in {"true", "false", "0", "1"}
+
+
+def _care_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    return str(value or "").strip().casefold() in {"true", "1"}
+
+
+def _care_datetime(day: str, clock: str | None) -> str:
+    parsed_date = date.fromisoformat(day)
+    parsed_time = time.fromisoformat(clock or "00:00")
+    value = datetime.combine(parsed_date, parsed_time, ZoneInfo("Europe/Stockholm"))
+    return value.astimezone(UTC).isoformat()
+
+
+def _dates_by_school(value: Any) -> dict[str, set[str]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, set[str]] = {}
+    for school_id, dates in value.items():
+        if not isinstance(dates, list):
+            continue
+        normalized = {_care_date(item) for item in dates}
+        result[str(school_id)] = {item for item in normalized if item}
+    return result
 
 
 def _sanitize_raw(value: Any) -> Any:

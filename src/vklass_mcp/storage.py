@@ -109,7 +109,9 @@ class Store:
             rows = await cursor.fetchall()
         return {str(row["key"]): str(row["value"]) for row in rows}
 
-    async def upsert_children(self, children: list[dict[str, Any]]) -> None:
+    async def upsert_children(
+        self, children: list[dict[str, Any]], *, authoritative: bool = True
+    ) -> None:
         now = utc_now()
         values = [
             (
@@ -124,14 +126,25 @@ class Store:
             if child.get("id")
         ]
         if not values:
+            if authoritative:
+                async with self._write_transaction():
+                    await self.db.execute("DELETE FROM records WHERE child_id IS NOT NULL")
+                    await self.db.execute("DELETE FROM children")
             return
         child_ids = [value[0] for value in values]
         placeholders = ",".join("?" for _ in child_ids)
         async with self._write_transaction():
-            await self.db.execute(
-                f"DELETE FROM children WHERE id NOT IN ({placeholders})",  # noqa: S608
-                child_ids,
-            )
+            if authoritative:
+                await self.db.execute(
+                    f"DELETE FROM children WHERE id NOT IN ({placeholders})",  # noqa: S608
+                    child_ids,
+                )
+                await self.db.execute(
+                    f"""DELETE FROM records
+                        WHERE child_id IS NOT NULL
+                          AND child_id NOT IN ({placeholders})""",  # noqa: S608
+                    child_ids,
+                )
             await self.db.executemany(
                 """INSERT INTO children(id, name, school_id, school_name, data_json, updated_at)
                    VALUES(?, ?, ?, ?, ?, ?)
@@ -158,44 +171,47 @@ class Store:
     async def upsert_records(self, records: list[dict[str, Any]]) -> None:
         if not records:
             return
-        now = utc_now()
-        values = []
-        for record in records:
-            values.append(
-                (
-                    str(record["kind"]),
-                    str(record["key"]),
-                    _optional_str(record.get("child_id")),
-                    str(record.get("title") or ""),
-                    str(record.get("audience") or ""),
-                    _optional_str(record.get("start_at")),
-                    _optional_str(record.get("end_at")),
-                    str(record.get("body_text") or ""),
-                    str(record.get("body_html") or ""),
-                    json.dumps(record.get("data") or {}, ensure_ascii=False, separators=(",", ":")),
-                    _optional_str(record.get("source_updated_at")),
-                    now,
-                )
-            )
         async with self._write_transaction():
-            await self.db.executemany(
-                """INSERT INTO records(
-                     kind, key, child_id, title, audience, start_at, end_at,
-                     body_text, body_html, data_json, source_updated_at, cached_at
-                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(kind,key) DO UPDATE SET
-                     child_id=excluded.child_id,
-                     title=excluded.title,
-                     audience=excluded.audience,
-                     start_at=excluded.start_at,
-                     end_at=excluded.end_at,
-                     body_text=excluded.body_text,
-                     body_html=excluded.body_html,
-                     data_json=excluded.data_json,
-                     source_updated_at=excluded.source_updated_at,
-                     cached_at=excluded.cached_at""",
-                values,
-            )
+            await self._upsert_records_unlocked(records)
+
+    async def replace_record_window(
+        self,
+        *,
+        kinds: list[str],
+        child_ids: list[str],
+        start_at: str,
+        end_at: str,
+        records: list[dict[str, Any]],
+    ) -> None:
+        """Atomically replace an authoritative window for an explicit ward allow-list."""
+
+        if not kinds or not child_ids:
+            return
+        kind_placeholders = ",".join("?" for _ in kinds)
+        child_placeholders = ",".join("?" for _ in child_ids)
+        sql = f"""DELETE FROM records
+                  WHERE kind IN ({kind_placeholders})
+                    AND child_id IN ({child_placeholders})
+                    AND start_at>=? AND start_at<?"""  # noqa: S608
+        allowed = set(child_ids)
+        safe_records = [
+            record for record in records if str(record.get("child_id") or "") in allowed
+        ]
+        async with self._write_transaction():
+            await self.db.execute(sql, [*kinds, *child_ids, start_at, end_at])
+            await self._upsert_records_unlocked(safe_records)
+
+    async def delete_records_outside_window(
+        self, *, kinds: list[str], start_at: str, end_at: str
+    ) -> None:
+        if not kinds:
+            return
+        placeholders = ",".join("?" for _ in kinds)
+        sql = f"""DELETE FROM records
+                  WHERE kind IN ({placeholders})
+                    AND (start_at<? OR start_at>=?)"""  # noqa: S608
+        async with self._write_transaction():
+            await self.db.execute(sql, [*kinds, start_at, end_at])
 
     async def delete_records(self, *, kinds: list[str], child_id: str | None = None) -> None:
         if not kinds:
@@ -285,15 +301,57 @@ class Store:
             rows = await cursor.fetchall()
         return {str(row["kind"]): int(row["count"]) for row in rows}
 
+    async def _upsert_records_unlocked(self, records: list[dict[str, Any]]) -> None:
+        if not records:
+            return
+        now = utc_now()
+        values = [
+            (
+                str(record["kind"]),
+                str(record["key"]),
+                _optional_str(record.get("child_id")),
+                str(record.get("title") or ""),
+                str(record.get("audience") or ""),
+                _optional_str(record.get("start_at")),
+                _optional_str(record.get("end_at")),
+                str(record.get("body_text") or ""),
+                str(record.get("body_html") or ""),
+                json.dumps(record.get("data") or {}, ensure_ascii=False, separators=(",", ":")),
+                _optional_str(record.get("source_updated_at")),
+                now,
+            )
+            for record in records
+        ]
+        await self.db.executemany(
+            """INSERT INTO records(
+                 kind, key, child_id, title, audience, start_at, end_at,
+                 body_text, body_html, data_json, source_updated_at, cached_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(kind,key) DO UPDATE SET
+                 child_id=excluded.child_id,
+                 title=excluded.title,
+                 audience=excluded.audience,
+                 start_at=excluded.start_at,
+                 end_at=excluded.end_at,
+                 body_text=excluded.body_text,
+                 body_html=excluded.body_html,
+                 data_json=excluded.data_json,
+                 source_updated_at=excluded.source_updated_at,
+                 cached_at=excluded.cached_at""",
+            values,
+        )
+
     @asynccontextmanager
     async def _write_transaction(self) -> AsyncIterator[None]:
         async with self._db_lock:
             try:
                 yield
                 await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
+            except BaseException:
+                try:
+                    await asyncio.shield(self.db.rollback())
+                finally:
+                    raise
 
 
 def _optional_str(value: Any) -> str | None:

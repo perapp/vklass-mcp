@@ -6,20 +6,23 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from vklass_mcp.config import Settings
 from vklass_mcp.parsers import (
     normalize_calendar_events,
+    normalize_care_schedule,
     normalize_news_items,
-    parse_children,
+    parse_children_authoritative,
     parse_study_courses,
     parse_weekly_reports,
     plain_text,
     selected_school_id,
     snapshot_record,
+    validate_care_schedule_payload,
 )
 from vklass_mcp.session_store import SessionStore
 from vklass_mcp.storage import Store, utc_now
@@ -138,8 +141,10 @@ class VklassService:
             absence_html = await self._capture(
                 "absence", self.client.absence_notify, errors, default=""
             )
-            children = parse_children(str(absence_html), str(home_html))
-            await self.store.upsert_children(children)
+            children, children_authoritative = parse_children_authoritative(
+                str(absence_html), str(home_html)
+            )
+            await self.store.upsert_children(children, authoritative=children_authoritative)
             counts["children"] = len(children)
 
             snapshots = []
@@ -231,6 +236,9 @@ class VklassService:
             counts["assignments"] = sum(
                 1 for item in calendar_records if item["kind"] == "assignment"
             )
+
+            care_records, _ = await self._sync_care_schedule(children, errors)
+            counts["care_schedule"] = len(care_records)
 
             completed = utc_now()
             await self.store.set_metadata("last_sync_started", started)
@@ -378,6 +386,68 @@ class VklassService:
                 cursor = next_month
         return records
 
+    async def _sync_care_schedule(
+        self,
+        children: list[dict[str, Any]],
+        errors: dict[str, str],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        child_ids = sorted({str(child["id"]) for child in children if child.get("id")})
+        if not child_ids:
+            errors["care_schedule"] = "No known wards; care schedule was not synchronized"
+            return [], False
+
+        today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+        requested_start = today - timedelta(days=self.settings.calendar_past_days)
+        requested_end = today + timedelta(days=self.settings.calendar_future_days)
+        cursor = requested_start
+        records: dict[str, dict[str, Any]] = {}
+        complete = True
+        while cursor <= requested_end:
+            try:
+                payload = await self.client.care_schedule(cursor)
+                batch_start, batch_end = _care_response_window(payload, cursor)
+                window_start = max(batch_start, requested_start)
+                window_end = min(batch_end, requested_end)
+                returned_child_ids = {str(item["studentId"]) for item in payload["scheduleData"]}
+                if not returned_child_ids.issubset(set(child_ids)):
+                    complete = False
+                    errors["care_schedule:unknown_ward"] = (
+                        "Vklass returned care data outside the known ward allow-list"
+                    )
+                    cursor = batch_end + timedelta(days=1)
+                    continue
+                batch_records = [
+                    record
+                    for record in normalize_care_schedule(payload)
+                    if window_start.isoformat()
+                    <= str((record.get("data") or {}).get("date") or "")
+                    <= window_end.isoformat()
+                ]
+                await self.store.replace_record_window(
+                    kinds=["care_schedule"],
+                    child_ids=child_ids,
+                    start_at=_stockholm_day_start(window_start),
+                    end_at=_stockholm_day_start(window_end + timedelta(days=1)),
+                    records=batch_records,
+                )
+                for record in batch_records:
+                    records[str(record["key"])] = record
+                cursor = batch_end + timedelta(days=1)
+            except AuthenticationRequired:
+                await self._mark_authentication_required()
+                raise
+            except Exception as error:
+                complete = False
+                errors[f"care_schedule:{cursor.isoformat()}"] = f"{type(error).__name__}: {error}"
+                break
+        if complete:
+            await self.store.delete_records_outside_window(
+                kinds=["care_schedule"],
+                start_at=_stockholm_day_start(requested_start),
+                end_at=_stockholm_day_start(requested_end + timedelta(days=1)),
+            )
+        return list(records.values()), complete
+
     async def _capture(
         self,
         key: str,
@@ -480,10 +550,14 @@ CAPABILITIES: list[dict[str, Any]] = [
     {"feature": "absence_overview", "support": "snapshot", "source": "/Absence/Notify"},
     {"feature": "class_list", "support": "disabled_privacy_other_children"},
     {"feature": "news_attachments", "support": "metadata_only", "source": "/Home/NewsArticles"},
+    {
+        "feature": "care_schedule",
+        "support": "implemented",
+        "source": "/CareSchedule/LoadDays",
+    },
     {"feature": "messages", "support": "not_yet_mapped"},
     {"feature": "documents", "support": "not_yet_mapped"},
     {"feature": "development_talks", "support": "not_yet_mapped"},
-    {"feature": "care_schedule", "support": "not_yet_mapped"},
     {"feature": "leave_and_absence_writes", "support": "disabled_read_only"},
 ]
 
@@ -516,6 +590,33 @@ def _next_month(value: datetime) -> datetime:
     if value.month == 12:
         return value.replace(year=value.year + 1, month=1)
     return value.replace(month=value.month + 1)
+
+
+def _care_response_window(payload: Any, expected_start: date) -> tuple[date, date]:
+    try:
+        validate_care_schedule_payload(payload)
+    except ValueError as error:
+        raise VklassResponseError(str(error)) from error
+    try:
+        response_start = date.fromisoformat(str(payload["fromDate"]))
+        response_end = date.fromisoformat(str(payload["untilDate"]))
+    except (KeyError, TypeError, ValueError) as error:
+        raise VklassResponseError("care schedule response had an invalid date window") from error
+    if (
+        response_start != expected_start
+        or response_end < response_start
+        or response_end > response_start + timedelta(days=35)
+    ):
+        raise VklassResponseError("care schedule response did not cover the requested window")
+    return response_start, response_end
+
+
+def _stockholm_day_start(value: date) -> str:
+    return (
+        datetime.combine(value, datetime.min.time(), ZoneInfo("Europe/Stockholm"))
+        .astimezone(UTC)
+        .isoformat()
+    )
 
 
 def _parse_json(value: str | None, default: Any) -> Any:

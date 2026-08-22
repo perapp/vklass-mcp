@@ -61,13 +61,14 @@ Users should also understand that their MCP client may send tool results to its 
 | Children/wards | Normalized |
 | Teacher news and **veckobrev** | Normalized/searchable |
 | Calendar, lessons, homework, tests and assignments | Normalized per child |
+| Omsorgsschema, including planned and actual attendance times | Normalized per child |
 | Automatic weekly reports | Normalized separately from teacher veckobrev |
 | Meals and notification count | Normalized |
 | Study courses, judgements and grades | Normalized per child |
 | Study and absence overview | Plain-text snapshots |
 | Class list | Disabled to avoid unrelated children |
 | News attachments | Metadata only |
-| Messages, documents, development talks, care schedule | Endpoint mapping pending |
+| Messages, documents, development talks | Endpoint mapping pending |
 | All write operations | Disabled |
 
 ## MCP tools
@@ -76,7 +77,7 @@ Users should also understand that their MCP client may send tool results to its 
 - `vklass_list_children`
 - `vklass_list_weekly_letters`, `vklass_get_weekly_letter`
 - `vklass_list_news`, `vklass_get_news_article`
-- `vklass_list_calendar`, `vklass_list_assignments`
+- `vklass_list_calendar`, `vklass_list_assignments`, `vklass_list_care_schedule`
 - `vklass_list_automatic_weekly_reports`
 - `vklass_get_meals`, `vklass_get_notifications`
 - `vklass_list_study_courses`, `vklass_get_feature_snapshot`, `vklass_search`
