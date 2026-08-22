@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+
+# Local runtime and secrets
+.env
+.env.*
+!.env.example
+state/
+*.db
+*.db-*
+*.sqlite*
+*.key
+*.pem
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

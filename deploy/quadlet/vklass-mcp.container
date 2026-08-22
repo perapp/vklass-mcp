@@ -1,0 +1,37 @@
+[Unit]
+Description=Vklass guardian MCP server
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image=localhost/vklass-mcp:latest
+Pull=never
+ContainerName=vklass-mcp
+# A TLS reverse proxy publishes the service; never expose this HTTP port directly.
+PublishPort=127.0.0.1:8787:8000
+EnvironmentFile=%h/.config/vklass-mcp/server.env
+Secret=vklass-mcp-state-key,type=mount,target=state-key,uid=10001,gid=10001,mode=0400
+Volume=%h/.local/share/vklass-mcp:/data:Z
+User=10001
+Group=10001
+UserNS=keep-id:uid=10001,gid=10001
+ReadOnly=true
+ReadOnlyTmpfs=true
+NoNewPrivileges=true
+DropCapability=all
+PidsLimit=256
+HealthCmd=vklass-mcp-healthcheck
+HealthInterval=10s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=5s
+HealthOnFailure=kill
+
+[Service]
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
