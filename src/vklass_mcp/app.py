@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import logging
+import re
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from time import monotonic
 from typing import Any, cast
 
 from mcp.server.auth.handlers.token import TokenHandler
@@ -12,6 +15,7 @@ from mcp.server.auth.routes import build_metadata
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ContentBlock
 from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -25,6 +29,40 @@ from vklass_mcp.mcp_server import register_tools
 from vklass_mcp.oauth import SCOPES, OAuthProvider
 from vklass_mcp.rate_limit import RateLimitMiddleware
 from vklass_mcp.registry import UserRegistry
+
+_LOG = logging.getLogger(__name__)
+_SAFE_MCP_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+
+
+class AuditedFastMCP(FastMCP[Any]):
+    """FastMCP with metadata-only tool-call diagnostics."""
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> Sequence[ContentBlock] | dict[str, Any]:
+        started = monotonic()
+        safe_name = name if _SAFE_MCP_NAME.fullmatch(name) else "<invalid>"
+        safe_keys = sorted(
+            key for key in arguments if isinstance(key, str) and _SAFE_MCP_NAME.fullmatch(key)
+        )
+        try:
+            result = await super().call_tool(name, arguments)
+        except Exception as error:
+            _LOG.warning(
+                "MCP tool call failed name=%s argument_keys=%s error=%s duration_ms=%d",
+                safe_name,
+                ",".join(safe_keys),
+                type(error).__name__,
+                round((monotonic() - started) * 1000),
+            )
+            raise
+        _LOG.info(
+            "MCP tool call completed name=%s argument_keys=%s duration_ms=%d",
+            safe_name,
+            ",".join(safe_keys),
+            round((monotonic() - started) * 1000),
+        )
+        return result
 
 
 class Application:
@@ -56,7 +94,7 @@ class Application:
             required_scopes=["vklass.read"],
             resource_server_url=AnyHttpUrl(settings.resource_server_url),
         )
-        self.mcp: FastMCP[Any] = FastMCP(
+        self.mcp: FastMCP[Any] = AuditedFastMCP(
             "Vklass",
             instructions=(
                 "Read-only access to the authenticated user's own Vklass guardian account. "

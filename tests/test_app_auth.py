@@ -18,7 +18,9 @@ def _challenge(verifier: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_mcp_oauth_discovery_and_subject_token(tmp_path: Path) -> None:
+async def test_mcp_oauth_discovery_and_subject_token(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     settings = Settings(
         data_dir=tmp_path,
         public_base_url="http://127.0.0.1:8000",
@@ -170,6 +172,14 @@ async def test_mcp_oauth_discovery_and_subject_token(tmp_path: Path) -> None:
                 care_schema = tools["vklass_list_care_schedule"].inputSchema
                 assert "Inclusive start date" in care_schema["properties"]["start"]["description"]
                 assert "Inclusive end date" in care_schema["properties"]["end"]["description"]
+                invalid = await session.call_tool("vklass_list_care_schedule", {"limit": 0})
+                assert invalid.isError
+                assert any(
+                    "MCP tool call failed name=vklass_list_care_schedule " in record.message
+                    and "argument_keys=limit" in record.message
+                    and "error=ToolError" in record.message
+                    for record in caplog.records
+                )
                 result = await session.call_tool("vklass_capabilities", {})
                 assert not result.isError
 
