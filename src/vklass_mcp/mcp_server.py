@@ -6,13 +6,14 @@ import logging
 import re
 from datetime import UTC, datetime, timedelta
 from time import monotonic
-from typing import Any
+from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
 from dateutil import parser as date_parser
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from vklass_mcp.registry import UserRegistry
 from vklass_mcp.service import CAPABILITIES, VklassService
@@ -57,7 +58,12 @@ def register_tools(mcp: FastMCP[Any], registry: UserRegistry) -> None:
 
     @mcp.tool(annotations=_LIVE_READ)
     async def vklass_sync_now() -> dict[str, Any]:
-        """Read current data from Vklass and refresh the local cache."""
+        """Refresh Vklass caches only; returns status/counts, not records.
+
+        Never use this result alone to answer a question about schedules, events, news,
+        assignments, or other Vklass content. After synchronization, always call the
+        relevant ``vklass_list_*`` or ``vklass_get_*`` tool to retrieve the records.
+        """
 
         service = await _current_service(registry)
         return await service.sync_all()
@@ -176,12 +182,41 @@ def register_tools(mcp: FastMCP[Any], registry: UserRegistry) -> None:
 
     @mcp.tool(annotations=_READ_ONLY)
     async def vklass_list_care_schedule(
-        child: str | None = None,
-        start: str | None = None,
-        end: str | None = None,
-        limit: int = 200,
+        child: Annotated[
+            str | None,
+            Field(description="Optional child name/alias; omit to include all own children."),
+        ] = None,
+        start: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Inclusive start date as YYYY-MM-DD. For an ISO calendar week, pass "
+                    "that week's Monday. Defaults to today in Europe/Stockholm."
+                )
+            ),
+        ] = None,
+        end: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Inclusive end date as YYYY-MM-DD. For an ISO calendar week, pass "
+                    "that week's Sunday. Defaults to 14 days after today."
+                )
+            ),
+        ] = None,
+        limit: Annotated[
+            int,
+            Field(ge=1, le=500, description="Maximum number of schedule-day records."),
+        ] = 200,
     ) -> list[dict[str, Any]]:
-        """List cached omsorgsschema with planned care and actual drop-off/pick-up times."""
+        """Retrieve omsorgsschema/care/fritids schedule records for a date range.
+
+        Use this tool for planned care hours, drop-off/pick-up, leave, closure, holiday,
+        and calendar-week questions. Convert a requested ISO week to its inclusive
+        Monday-to-Sunday dates. If freshness is requested, call ``vklass_sync_now`` first,
+        then always call this tool; synchronization itself does not return schedule data.
+        Do not substitute the school-calendar tool for omsorgsschema.
+        """
 
         started = monotonic()
         try:

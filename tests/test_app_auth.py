@@ -159,7 +159,17 @@ async def test_mcp_oauth_discovery_and_subject_token(tmp_path: Path) -> None:
                 ),
                 ClientSession(read_stream, write_stream) as session,
             ):
-                await session.initialize()
+                initialized = await session.initialize()
+                assert initialized.instructions is not None
+                assert "always call the relevant list/get tool" in initialized.instructions
+                tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                sync_description = tools["vklass_sync_now"].description or ""
+                care_description = tools["vklass_list_care_schedule"].description or ""
+                assert "returns status/counts, not records" in sync_description
+                assert "Monday-to-Sunday" in care_description
+                care_schema = tools["vklass_list_care_schedule"].inputSchema
+                assert "Inclusive start date" in care_schema["properties"]["start"]["description"]
+                assert "Inclusive end date" in care_schema["properties"]["end"]["description"]
                 result = await session.call_tool("vklass_capabilities", {})
                 assert not result.isError
 
