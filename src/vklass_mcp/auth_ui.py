@@ -26,7 +26,7 @@ body{font:16px system-ui,sans-serif;max-width:680px;margin:2rem auto;padding:0 1
 #qr{width:min(340px,90vw);display:none;image-rendering:pixelated}.error{color:#a00}code{word-break:break-word}
 </style></head><body><h1>Authorize Vklass MCP</h1>
 <div class="card"><p><strong>Client:</strong> CLIENT_NAME</p><p><strong>Return address:</strong> <code>REDIRECT_URI</code></p><p><strong>Requested access:</strong> SCOPES</p>
-<p>You will authenticate directly with your own Vklass account using BankID. This client can only access data belonging to that account.</p></div>
+<p>ACCESS_DESCRIPTION</p><p>You will authenticate directly with your own Vklass account using BankID. This client can only access data belonging to that account.</p></div>
 <div class="card"><strong id="state">Ready</strong><p id="message">Start BankID to continue.</p><img id="qr" alt="BankID QR code"></div>
 <button id="approve">Continue with BankID</button><button id="finish" style="display:none">Authorize this client</button><button id="deny">Deny</button>
 <script>
@@ -59,12 +59,21 @@ def register_auth_routes(
         if flow is None:
             return HTMLResponse("Authorization request expired", status_code=410)
         client_name = html.escape(flow.client.client_name or "Unnamed MCP client")
-        scopes = html.escape(", ".join(flow.params.scopes or ["vklass.read"]))
+        requested_scopes = flow.params.scopes or ["vklass.read"]
+        scopes = html.escape(", ".join(requested_scopes))
+        if "vklass.write" in requested_scopes:
+            access_description = (
+                "This grants read access and allows the client to submit real absence reports "
+                "after your explicit confirmation."
+            )
+        else:
+            access_description = "This grants read-only access; Vklass changes are not allowed."
         redirect_uri = html.escape(str(flow.params.redirect_uri))
         page = (
             _PAGE.replace("CLIENT_NAME", client_name)
             .replace("REDIRECT_URI", redirect_uri)
             .replace("SCOPES", scopes)
+            .replace("ACCESS_DESCRIPTION", access_description)
         )
         return HTMLResponse(page, headers=_security_headers())
 
@@ -240,7 +249,7 @@ def _authorize_write(request: Request, settings: Settings) -> Response | None:
     if request.headers.get("X-Vklass-OAuth") != "1":
         return JSONResponse({"error": "missing OAuth UI request header"}, status_code=403)
     origin = request.headers.get("Origin")
-    if origin and origin.rstrip("/") != settings.public_base_url.rstrip("/"):
+    if not origin or origin.rstrip("/") != settings.public_base_url.rstrip("/"):
         return JSONResponse({"error": "origin rejected"}, status_code=403)
     return None
 

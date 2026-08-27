@@ -4,6 +4,7 @@ from vklass_mcp.parsers import (
     normalize_calendar_events,
     normalize_care_schedule,
     normalize_news_item,
+    parse_absence_form,
     parse_account_identity,
     parse_children,
     parse_children_authoritative,
@@ -64,6 +65,34 @@ def test_authoritative_child_list_requires_valid_embedded_payload() -> None:
 
     partial = "<html><h1>Frånvaro</h1></html>"
     assert parse_children_authoritative(partial) == ([], False)
+
+
+def test_absence_form_extracts_token_quick_date_and_per_child_limits() -> None:
+    payload = (
+        '{"studentOptions":[{"value":"12345","additionalValues":'
+        '{"AbsenceBoundaryMinDate":"2026-08-27 06:00",'
+        '"AbsenceBoundaryMaxDate":"2026-08-28 20:00"}}],'
+        '"quickOptionDate":"2026-08-27"}'
+    )
+    html = f"""
+    <form action="/Absence/Notify" method="post">
+      <input name="__RequestVerificationToken" value="csrf-secret">
+    </form>
+    <script>
+      enhanceServerHtml('absence-notify', 'common/views/absence/absence-notify', '{payload}')
+    </script>
+    """
+
+    assert parse_absence_form(html) == {
+        "request_verification_token": "csrf-secret",
+        "quick_date": "2026-08-27",
+        "students": {
+            "12345": {
+                "minimum": "2026-08-27 06:00",
+                "maximum": "2026-08-28 20:00",
+            }
+        },
+    }
 
 
 def test_calendar_assignment_event_type_two() -> None:

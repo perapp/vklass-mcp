@@ -1,7 +1,7 @@
 [project]
 name = "vklass-mcp"
-version = "0.3.0"
-description = "Self-hosted, read-only MCP server for Vklass guardian data"
+version = "0.4.0"
+description = "Self-hosted MCP server for Vklass guardian data and absence reporting"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"

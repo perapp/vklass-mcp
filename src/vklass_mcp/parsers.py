@@ -140,6 +140,60 @@ def parse_children_authoritative(
     return children, actual_ids == expected_ids
 
 
+def parse_absence_form(html: str) -> dict[str, Any]:
+    """Extract the anti-forgery token and per-ward limits from the absence form."""
+
+    soup = BeautifulSoup(html, "html.parser")
+    form = soup.find("form", attrs={"action": "/Absence/Notify"})
+    if form is None:
+        raise ValueError("Vklass absence form was not present")
+    token_input = form.find("input", attrs={"name": "__RequestVerificationToken"})
+    token = str(token_input.get("value") or "").strip() if token_input else ""
+    payload = _aurelia_payload(
+        html,
+        component="absence-notify",
+        view="common/views/absence/absence-notify",
+    )
+    if not token or not isinstance(payload, dict):
+        raise ValueError("Vklass absence form was incomplete")
+
+    quick_date = str(payload.get("quickOptionDate") or "").strip()
+    try:
+        date.fromisoformat(quick_date)
+    except ValueError as error:
+        raise ValueError("Vklass absence form had an invalid quick date") from error
+
+    students: dict[str, dict[str, str]] = {}
+    options = payload.get("studentOptions")
+    if not isinstance(options, list):
+        raise ValueError("Vklass absence form had no ward options")
+    for option in options:
+        if not isinstance(option, dict):
+            raise ValueError("Vklass absence form had an invalid ward option")
+        child_id = str(option.get("value") or "").strip()
+        limits = option.get("additionalValues")
+        if option.get("disabled") is True or option.get("readOnly") is True:
+            continue
+        if not child_id.isdigit() or not isinstance(limits, dict):
+            raise ValueError("Vklass absence form had an invalid ward option")
+        minimum = str(limits.get("AbsenceBoundaryMinDate") or "").strip()
+        maximum = str(limits.get("AbsenceBoundaryMaxDate") or "").strip()
+        try:
+            minimum_at = datetime.strptime(minimum, "%Y-%m-%d %H:%M")
+            maximum_at = datetime.strptime(maximum, "%Y-%m-%d %H:%M")
+        except ValueError as error:
+            raise ValueError("Vklass absence form had invalid ward limits") from error
+        if maximum_at <= minimum_at:
+            raise ValueError("Vklass absence form had an invalid ward interval")
+        students[child_id] = {"minimum": minimum, "maximum": maximum}
+
+    return {
+        "request_verification_token": token,
+        "quick_date": quick_date,
+        "students": students,
+    }
+
+
 def normalize_news_items(payload: Any) -> tuple[list[dict[str, Any]], str | None]:
     if isinstance(payload, list):
         items = payload

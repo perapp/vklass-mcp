@@ -1,4 +1,4 @@
-"""Authenticated, read-only client for the Vklass guardian web application."""
+"""Authenticated client for supported Vklass guardian web operations."""
 
 from __future__ import annotations
 
@@ -10,10 +10,13 @@ from datetime import date, datetime
 from http.cookies import SimpleCookie
 from typing import Any
 from urllib.parse import urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import aiohttp
+from bs4 import BeautifulSoup
 from yarl import URL
 
+from vklass_mcp.parsers import parse_absence_form, plain_text
 from vklass_mcp.vklass.auth import authenticate as authenticate_goteborg
 
 _LOG = logging.getLogger(__name__)
@@ -32,8 +35,12 @@ class VklassResponseError(ConnectionError):
     """A Vklass endpoint returned an unexpected response."""
 
 
+class VklassSubmissionOutcomeUnknown(ConnectionError):
+    """A write may have reached Vklass, so callers must not retry automatically."""
+
+
 class VklassClient:
-    """Own the Vklass cookie jar and expose only read/query operations."""
+    """Own the Vklass cookie jar and expose supported guardian operations."""
 
     def __init__(self, timeout_seconds: int, cookie_callback: CookieCallback) -> None:
         self.timeout_seconds = timeout_seconds
@@ -55,7 +62,7 @@ class VklassClient:
             headers={
                 "Accept": "*/*",
                 "Accept-Language": "sv-SE,sv;q=0.9,en;q=0.7",
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) VklassMCP/0.3",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) VklassMCP/0.4",
             },
         )
 
@@ -132,6 +139,60 @@ class VklassClient:
 
     async def absence_notify(self) -> str:
         return await self.get_text("/Absence/Notify")
+
+    async def report_absence_today(self, child_id: str) -> dict[str, Any]:
+        """Submit Vklass' school-configured quick option for today's absence."""
+
+        async with self._operation_lock:
+            form = await self._absence_form_unlocked()
+            limits = _absence_limits(form, child_id)
+            payload = _absence_payload(form, child_id, limits)
+            payload["Notify.QuickOptionDate"] = str(form["quick_date"])
+            await self._submit_absence_form_unlocked(payload)
+            return {"mode": "today", "date": str(form["quick_date"])}
+
+    async def report_absence_period(
+        self, child_id: str, start: datetime, end: datetime
+    ) -> dict[str, Any]:
+        """Submit an explicit local date/time interval as guardian-reported absence."""
+
+        stockholm = ZoneInfo("Europe/Stockholm")
+        local_start = start.astimezone(stockholm)
+        local_end = end.astimezone(stockholm)
+        async with self._operation_lock:
+            form = await self._absence_form_unlocked()
+            limits = _absence_limits(form, child_id)
+            minimum = datetime.strptime(limits["minimum"], "%Y-%m-%d %H:%M").replace(
+                tzinfo=stockholm
+            )
+            maximum = datetime.strptime(limits["maximum"], "%Y-%m-%d %H:%M").replace(
+                tzinfo=stockholm
+            )
+            if local_start < minimum or local_end > maximum:
+                raise ValueError(
+                    "absence period must be within the school's currently allowed interval: "
+                    f"{minimum.isoformat()} to {maximum.isoformat()}"
+                )
+            if local_end <= local_start:
+                raise ValueError("absence end must be later than start")
+
+            payload = _absence_payload(form, child_id, limits)
+            payload.update(
+                {
+                    "Notify.QuickOptionDateIsNull": "True",
+                    "Notify.QuickOptionDate": "",
+                    "Notify.StartDate": local_start.date().isoformat(),
+                    "Notify.StartTime": local_start.strftime("%H:%M"),
+                    "Notify.EndDate": local_end.date().isoformat(),
+                    "Notify.EndTime": local_end.strftime("%H:%M"),
+                }
+            )
+            await self._submit_absence_form_unlocked(payload)
+            return {
+                "mode": "period",
+                "start": local_start.isoformat(),
+                "end": local_end.isoformat(),
+            }
 
     async def weekly_reports(self) -> str:
         return await self.get_text(
@@ -248,6 +309,58 @@ class VklassClient:
             await self._capture_cookie()
             return body, response.headers.get("Content-Type", "application/octet-stream")
 
+    async def _absence_form_unlocked(self) -> dict[str, Any]:
+        response, body = await self._request_unlocked("GET", "/Absence/Notify")
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "text/" not in content_type and "html" not in content_type:
+            raise VklassResponseError("expected HTML from /Absence/Notify")
+        html = body.decode(response.charset or "utf-8", errors="replace")
+        return parse_absence_form(html)
+
+    async def _submit_absence_form_unlocked(self, data: dict[str, str]) -> None:
+        path = "/Absence/Notify"
+        if not self.authenticated:
+            raise AuthenticationRequired("Vklass login is required")
+        url = f"{CUSTODIAN_BASE}{path}"
+        try:
+            async with self._session.post(
+                url,
+                data=data,
+                headers={"Referer": url},
+                allow_redirects=False,
+            ) as response:
+                body = await response.read()
+                if response.status in (301, 302, 303, 307, 308):
+                    location = response.headers.get("Location")
+                    target = urlparse(urljoin(url, location)) if location else None
+                    if (
+                        response.status in (302, 303)
+                        and target is not None
+                        and target.hostname == "custodian.vklass.se"
+                        and target.path == path
+                    ):
+                        await self._capture_cookie()
+                        return
+                    if target is not None and (
+                        target.hostname != "custodian.vklass.se" or target.path != path
+                    ):
+                        self.authenticated = False
+                        raise AuthenticationRequired("Vklass session expired")
+                    raise VklassResponseError(
+                        f"{path} returned an unexpected HTTP {response.status} redirect"
+                    )
+                if response.status in (401, 403):
+                    self.authenticated = False
+                    raise AuthenticationRequired("Vklass session expired")
+                if response.status == 200:
+                    raise VklassResponseError(_absence_validation_error(body, response.charset))
+                raise VklassResponseError(f"{path} returned HTTP {response.status}")
+        except (TimeoutError, aiohttp.ClientError) as error:
+            raise VklassSubmissionOutcomeUnknown(
+                "the Vklass response was lost; check the absence overview and do not retry "
+                "automatically"
+            ) from error
+
     async def _request(
         self,
         method: str,
@@ -258,27 +371,40 @@ class VklassClient:
         headers: dict[str, str] | None = None,
     ) -> tuple[aiohttp.ClientResponse, bytes]:
         async with self._operation_lock:
-            if not self.authenticated:
-                raise AuthenticationRequired("Vklass login is required")
-            url = urljoin(f"{CUSTODIAN_BASE}/", path.lstrip("/"))
-            if urlparse(url).hostname != "custodian.vklass.se":
-                raise ValueError("Vklass request escaped the custodian host")
-            async with self._session.request(
-                method,
-                url,
-                params=params,
-                data=data,
-                headers=headers,
-                allow_redirects=False,
-            ) as response:
-                body = await response.read()
-                if response.status in (301, 302, 303, 307, 308, 401, 403):
-                    self.authenticated = False
-                    raise AuthenticationRequired("Vklass session expired")
-                if response.status != 200:
-                    raise VklassResponseError(f"{path} returned HTTP {response.status}")
-                await self._capture_cookie()
-                return response, body
+            return await self._request_unlocked(
+                method, path, params=params, data=data, headers=headers
+            )
+
+    async def _request_unlocked(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[aiohttp.ClientResponse, bytes]:
+        if not self.authenticated:
+            raise AuthenticationRequired("Vklass login is required")
+        url = urljoin(f"{CUSTODIAN_BASE}/", path.lstrip("/"))
+        if urlparse(url).hostname != "custodian.vklass.se":
+            raise ValueError("Vklass request escaped the custodian host")
+        async with self._session.request(
+            method,
+            url,
+            params=params,
+            data=data,
+            headers=headers,
+            allow_redirects=False,
+        ) as response:
+            body = await response.read()
+            if response.status in (301, 302, 303, 307, 308, 401, 403):
+                self.authenticated = False
+                raise AuthenticationRequired("Vklass session expired")
+            if response.status != 200:
+                raise VklassResponseError(f"{path} returned HTTP {response.status}")
+            await self._capture_cookie()
+            return response, body
 
     async def _capture_cookie(self, *, force: bool = False) -> None:
         morsel = self._session.cookie_jar.filter_cookies(URL(CUSTODIAN_BASE)).get(AUTH_COOKIE_NAME)
@@ -294,3 +420,45 @@ class VklassClient:
         if self.session is None or self.session.closed:
             raise RuntimeError("Vklass client is not open")
         return self.session
+
+
+def _absence_limits(form: dict[str, Any], child_id: str) -> dict[str, str]:
+    if not child_id.isdigit():
+        raise ValueError("child IDs must be numeric")
+    students = form.get("students")
+    limits = students.get(child_id) if isinstance(students, dict) else None
+    if not isinstance(limits, dict):
+        raise ValueError("child is not available in the Vklass absence form")
+    minimum = limits.get("minimum")
+    maximum = limits.get("maximum")
+    if not isinstance(minimum, str) or not isinstance(maximum, str):
+        raise VklassResponseError("Vklass absence limits were invalid")
+    return {"minimum": minimum, "maximum": maximum}
+
+
+def _absence_payload(form: dict[str, Any], child_id: str, limits: dict[str, str]) -> dict[str, str]:
+    return {
+        "Notify.FormOnly": "False",
+        "Notify.MinimumStartDateTime": limits["minimum"],
+        "Notify.MaximumEndDateTime": limits["maximum"],
+        "Notify.QuickOptionDateIsNull": "False",
+        "Notify.SelectedStudentIds": child_id,
+        "Notify.QuickOptionDate": "",
+        "Notify.StartDate": "",
+        "Notify.StartTime": "",
+        "Notify.EndDate": "",
+        "Notify.EndTime": "",
+        "__RequestVerificationToken": str(form["request_verification_token"]),
+    }
+
+
+def _absence_validation_error(body: bytes, charset: str | None) -> str:
+    html = body.decode(charset or "utf-8", errors="replace")
+    soup = BeautifulSoup(html, "html.parser")
+    messages: list[str] = []
+    for element in soup.select(".field-validation-error, .validation-summary-errors"):
+        message = plain_text(element.get_text(" "), 300)
+        if message and message not in messages:
+            messages.append(message)
+    detail = "; ".join(messages[:5])
+    return f"Vklass rejected the absence report{f': {detail}' if detail else ''}"

@@ -7,7 +7,7 @@ import pytest
 
 from vklass_mcp.config import Settings
 from vklass_mcp.service import VklassService
-from vklass_mcp.vklass.client import AuthenticationRequired
+from vklass_mcp.vklass.client import AuthenticationRequired, VklassSubmissionOutcomeUnknown
 
 
 @pytest.mark.asyncio
@@ -25,6 +25,86 @@ async def test_expired_authentication_aborts_sync_capture(tmp_path: Path) -> Non
             await service._capture("home", expired, {}, default="")
         assert service.auth_state == "required"
         assert await service.store.get_metadata("auth_state") == "required"
+    finally:
+        await service.store.close()
+
+
+@pytest.mark.asyncio
+async def test_report_absence_updates_cached_snapshot(tmp_path: Path) -> None:
+    service = VklassService(
+        Settings(data_dir=tmp_path, state_key="state-key-for-tests", _env_file=None)
+    )
+    service.client.authenticated = True
+    submitted: list[str] = []
+
+    async def report_absence_today(child_id: str) -> dict[str, str]:
+        submitted.append(child_id)
+        return {"mode": "today", "date": "2026-08-27"}
+
+    async def absence_notify() -> str:
+        return "<h1>Frånvaro registrerad</h1>"
+
+    service.client.report_absence_today = report_absence_today  # type: ignore[method-assign]
+    service.client.absence_notify = absence_notify  # type: ignore[method-assign]
+    await service.store.open()
+    try:
+        result = await service.report_absence_today("12345")
+
+        assert submitted == ["12345"]
+        assert result["status"] == "submitted"
+        assert result["period"] == {"mode": "today", "date": "2026-08-27"}
+        snapshot = await service.store.get_record("absence", "current")
+        assert snapshot is not None
+        assert snapshot["body_text"] == "Frånvaro registrerad"
+    finally:
+        await service.store.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_absence_submission_outcome_is_returned_without_retry(tmp_path: Path) -> None:
+    service = VklassService(
+        Settings(data_dir=tmp_path, state_key="state-key-for-tests", _env_file=None)
+    )
+    service.client.authenticated = True
+    attempts = 0
+
+    async def uncertain(_: str) -> dict[str, str]:
+        nonlocal attempts
+        attempts += 1
+        raise VklassSubmissionOutcomeUnknown("check overview; do not retry automatically")
+
+    service.client.report_absence_today = uncertain  # type: ignore[method-assign]
+    await service.store.open()
+    try:
+        result = await service.report_absence_today("12345")
+
+        assert attempts == 1
+        assert result["status"] == "outcome_unknown"
+    finally:
+        await service.store.close()
+
+
+@pytest.mark.asyncio
+async def test_successful_absence_report_is_not_failed_by_refresh_error(tmp_path: Path) -> None:
+    service = VklassService(
+        Settings(data_dir=tmp_path, state_key="state-key-for-tests", _env_file=None)
+    )
+    service.client.authenticated = True
+
+    async def report_absence_today(_: str) -> dict[str, str]:
+        return {"mode": "today", "date": "2026-08-27"}
+
+    async def failed_refresh() -> str:
+        raise ConnectionError("temporary")
+
+    service.client.report_absence_today = report_absence_today  # type: ignore[method-assign]
+    service.client.absence_notify = failed_refresh  # type: ignore[method-assign]
+    await service.store.open()
+    try:
+        result = await service.report_absence_today("12345")
+
+        assert result["status"] == "submitted"
+        assert "refresh_warning" in result
     finally:
         await service.store.close()
 

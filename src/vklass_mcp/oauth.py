@@ -33,7 +33,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 from vklass_mcp.config import Settings
 
-SCOPES = ["vklass.read"]
+SCOPES = ["vklass.read", "vklass.write"]
 
 
 class StoredRefreshToken(RefreshToken):
@@ -202,7 +202,8 @@ class OAuthProvider(
         requested = set((client_info.scope or "").split())
         if "vklass.read" not in requested or not requested.issubset(SCOPES):
             raise RegistrationError(
-                "invalid_client_metadata", "client scope must be exactly vklass.read"
+                "invalid_client_metadata",
+                "client scope must include vklass.read and may include vklass.write",
             )
         encrypted = self._fernet.encrypt(client_info.model_dump_json().encode("utf-8"))
         async with self._lock:

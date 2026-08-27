@@ -26,13 +26,18 @@ from vklass_mcp.parsers import (
 )
 from vklass_mcp.session_store import SessionStore
 from vklass_mcp.storage import Store, utc_now
-from vklass_mcp.vklass.client import AuthenticationRequired, VklassClient, VklassResponseError
+from vklass_mcp.vklass.client import (
+    AuthenticationRequired,
+    VklassClient,
+    VklassResponseError,
+    VklassSubmissionOutcomeUnknown,
+)
 
 _LOG = logging.getLogger(__name__)
 
 
 class VklassService:
-    """Long-lived read-only Vklass synchronization service."""
+    """Long-lived Vklass synchronization and guardian-action service."""
 
     def __init__(
         self,
@@ -57,6 +62,7 @@ class VklassService:
         self.last_auth_success: str | None = None
         self.last_auth_error: str | None = None
         self._sync_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
         self._background_tasks: list[asyncio.Task[None]] = []
         self._stopping = False
 
@@ -248,6 +254,66 @@ class VklassService:
             )
             await self.store.set_metadata("auth_state", self.auth_state)
             return {"status": "ok" if not errors else "partial", "counts": counts, "errors": errors}
+
+    async def report_absence_today(self, child_id: str) -> dict[str, Any]:
+        """Report one ward absent today using Vklass' school-configured quick option."""
+
+        return await self._report_absence(child_id, start=None, end=None)
+
+    async def report_absence_period(
+        self, child_id: str, start: datetime, end: datetime
+    ) -> dict[str, Any]:
+        """Report one ward absent for an explicit interval."""
+
+        return await self._report_absence(child_id, start=start, end=end)
+
+    async def _report_absence(
+        self,
+        child_id: str,
+        *,
+        start: datetime | None,
+        end: datetime | None,
+    ) -> dict[str, Any]:
+        if not self.client.authenticated:
+            raise AuthenticationRequired("BankID login is required before reporting absence")
+        async with self._write_lock:
+            try:
+                if start is None and end is None:
+                    period = await self.client.report_absence_today(child_id)
+                elif start is not None and end is not None:
+                    period = await self.client.report_absence_period(child_id, start, end)
+                else:
+                    raise ValueError("both start and end are required for a custom period")
+            except AuthenticationRequired:
+                await self._mark_authentication_required()
+                raise
+            except VklassSubmissionOutcomeUnknown as error:
+                return {
+                    "status": "outcome_unknown",
+                    "child_id": child_id,
+                    "message": str(error),
+                }
+
+            result = {
+                "status": "submitted",
+                "child_id": child_id,
+                "period": period,
+                "submitted_at": utc_now(),
+            }
+            try:
+                absence_html = await self.client.absence_notify()
+                await self.store.upsert_records(
+                    [snapshot_record("absence", "current", absence_html, "Absence overview")]
+                )
+            except AuthenticationRequired:
+                await self._mark_authentication_required()
+                result["refresh_warning"] = "Vklass accepted the report, but the session expired"
+            except Exception as error:
+                _LOG.warning("post-submission absence refresh failed: %s", type(error).__name__)
+                result["refresh_warning"] = (
+                    "Vklass accepted the report, but the cached overview could not be refreshed"
+                )
+            return result
 
     async def get_news_article(self, article_id: str) -> dict[str, Any] | None:
         record = await self.store.get_record("news", article_id)
@@ -548,6 +614,11 @@ CAPABILITIES: list[dict[str, Any]] = [
         "source": "/StudyOverview/Student",
     },
     {"feature": "absence_overview", "support": "snapshot", "source": "/Absence/Notify"},
+    {
+        "feature": "absence_reporting",
+        "support": "implemented_write",
+        "source": "/Absence/Notify",
+    },
     {"feature": "class_list", "support": "disabled_privacy_other_children"},
     {"feature": "news_attachments", "support": "metadata_only", "source": "/Home/NewsArticles"},
     {
@@ -558,7 +629,7 @@ CAPABILITIES: list[dict[str, Any]] = [
     {"feature": "messages", "support": "not_yet_mapped"},
     {"feature": "documents", "support": "not_yet_mapped"},
     {"feature": "development_talks", "support": "not_yet_mapped"},
-    {"feature": "leave_and_absence_writes", "support": "disabled_read_only"},
+    {"feature": "leave_requests", "support": "not_yet_mapped"},
 ]
 
 

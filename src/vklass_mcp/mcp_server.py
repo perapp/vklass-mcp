@@ -27,6 +27,12 @@ _LIVE_READ = ToolAnnotations(
     idempotentHint=False,
     openWorldHint=True,
 )
+_WRITE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
 
 
 def register_tools(mcp: FastMCP[Any], registry: UserRegistry) -> None:
@@ -34,7 +40,11 @@ def register_tools(mcp: FastMCP[Any], registry: UserRegistry) -> None:
     async def vklass_capabilities() -> dict[str, Any]:
         """List Vklass features and the implementation/support level of each."""
 
-        return {"read_only": True, "features": CAPABILITIES}
+        return {
+            "read_only": False,
+            "write_scope": "vklass.write",
+            "features": CAPABILITIES,
+        }
 
     @mcp.tool(annotations=_READ_ONLY)
     async def vklass_status() -> dict[str, Any]:
@@ -57,6 +67,50 @@ def register_tools(mcp: FastMCP[Any], registry: UserRegistry) -> None:
 
         service = await _current_service(registry)
         return await service.sync_all()
+
+    @mcp.tool(annotations=_WRITE)
+    async def vklass_report_absence_today(
+        child: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Report a child absent today in Vklass. Requires vklass.write and confirm=true.
+
+        Vklass applies the school's configured meaning of its Today quick option, which may
+        mean the full day or the remainder of the day. This creates a real absence report.
+        """
+
+        _require_write_scope()
+        if not confirm:
+            raise ValueError("confirm must be true to submit a real Vklass absence report")
+        service = await _current_service(registry)
+        child_id = await _resolve_child(service, child)
+        if child_id is None:
+            raise ValueError("child is required")
+        return await service.report_absence_today(child_id)
+
+    @mcp.tool(annotations=_WRITE)
+    async def vklass_report_absence_period(
+        child: str,
+        start: str,
+        end: str,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Report a child absent for an ISO 8601 interval. Requires write scope and confirmation.
+
+        Naive date-times are interpreted in Europe/Stockholm. This creates a real Vklass
+        absence report; both start and end must include a time of day.
+        """
+
+        _require_write_scope()
+        if not confirm:
+            raise ValueError("confirm must be true to submit a real Vklass absence report")
+        service = await _current_service(registry)
+        child_id = await _resolve_child(service, child)
+        if child_id is None:
+            raise ValueError("child is required")
+        start_at = _absence_datetime(start, "start")
+        end_at = _absence_datetime(end, "end")
+        return await service.report_absence_period(child_id, start_at, end_at)
 
     @mcp.tool(annotations=_READ_ONLY)
     async def vklass_list_weekly_letters(
@@ -298,6 +352,12 @@ async def _current_service(registry: UserRegistry) -> VklassService:
     return await registry.get(token.subject)
 
 
+def _require_write_scope() -> None:
+    token = get_access_token()
+    if token is None or "vklass.write" not in token.scopes:
+        raise PermissionError("the OAuth token does not grant the vklass.write scope")
+
+
 async def _resolve_child(service: VklassService, value: str | None) -> str | None:
     if not value:
         return None
@@ -312,6 +372,31 @@ async def _resolve_child(service: VklassService, value: str | None) -> str | Non
     if len(partial) == 1:
         return str(partial[0]["id"])
     raise ValueError("child must uniquely match a child ID or name")
+
+
+def _absence_datetime(value: str, field: str) -> datetime:
+    candidate = value.strip()
+    pattern = r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?"
+    if not re.fullmatch(pattern, candidate):
+        raise ValueError(f"{field} must be an ISO 8601 date-time including hours and minutes")
+    try:
+        parsed = date_parser.isoparse(candidate)
+    except (ValueError, OverflowError) as error:
+        raise ValueError(f"{field} must be a valid ISO 8601 date-time") from error
+    if parsed.second != 0 or parsed.microsecond != 0:
+        raise ValueError(f"{field} must use whole minutes")
+    if parsed.tzinfo is not None:
+        return parsed
+
+    stockholm = ZoneInfo("Europe/Stockholm")
+    localized = parsed.replace(tzinfo=stockholm, fold=0)
+    round_trip = localized.astimezone(UTC).astimezone(stockholm).replace(tzinfo=None)
+    if round_trip != parsed:
+        raise ValueError(f"{field} is not a valid local Europe/Stockholm time")
+    alternate = parsed.replace(tzinfo=stockholm, fold=1)
+    if alternate.utcoffset() != localized.utcoffset():
+        raise ValueError(f"{field} is ambiguous; include an explicit UTC offset")
+    return localized
 
 
 def _normalize_date(value: str | None, *, end_of_day: bool = False) -> str | None:

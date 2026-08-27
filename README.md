@@ -1,7 +1,8 @@
 # vklass-mcp
 
-A multi-user, read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for Vklass
-guardians. Every user authenticates their **own Vklass account** with BankID as part of the standard
+A multi-user [Model Context Protocol](https://modelcontextprotocol.io/) server for Vklass
+guardians, with data access and explicitly confirmed absence reporting. Every user authenticates
+their **own Vklass account** with BankID as part of the standard
 MCP OAuth flow. Each OAuth subject maps directly to one Vklass user ID; there is no shared login,
 global MCP token or administrator password.
 
@@ -34,12 +35,19 @@ https://vklass.example.com/mcp
 A compatible client discovers OAuth, opens the browser, asks the user to approve BankID, and stores
 its own tokens. Different users and clients use the same URL but receive different OAuth subjects.
 
-The server uses one least-privilege scope, `vklass.read`, for both cached and live read-only Vklass
-queries.
+The server uses separate least-privilege OAuth scopes: `vklass.read` for cached and live queries,
+and optional `vklass.write` for absence reporting. Existing read-only clients remain read-only;
+they must re-register and authorize the write scope before they can submit reports.
 
 ## Security
 
-- Vklass access is read-only. Absence reports, leave, messages and other mutations are not exposed.
+- The only exposed Vklass mutation is guardian absence reporting. Leave, messages, schedule changes,
+  deletion and other mutations are not exposed.
+- Absence tools require `vklass.write` plus `confirm=true`, use a fresh Vklass anti-forgery token,
+  restrict the child to the authenticated guardian's current wards, and honor school date limits.
+  New clients receive read-only scope by default and must explicitly request write access.
+- An interrupted submission returns `outcome_unknown`; clients must inspect Vklass rather than
+  retrying automatically and risking a duplicate report.
 - BankID approval is always performed by the account owner in a browser.
 - Vklass cookies and OAuth secrets are never returned through MCP or logs.
 - Göteborg SAML and BankID form/redirect hosts are strictly allow-listed.
@@ -66,15 +74,17 @@ Users should also understand that their MCP client may send tool results to its 
 | Meals and notification count | Normalized |
 | Study courses, judgements and grades | Normalized per child |
 | Study and absence overview | Plain-text snapshots |
+| Report absence today or for a date/time period | Implemented; explicit confirmation required |
 | Class list | Disabled to avoid unrelated children |
 | News attachments | Metadata only |
 | Messages, documents, development talks | Endpoint mapping pending |
-| All write operations | Disabled |
+| Leave requests and all other write operations | Not exposed |
 
 ## MCP tools
 
 - `vklass_capabilities`, `vklass_status`, `vklass_sync_now`
 - `vklass_list_children`
+- `vklass_report_absence_today`, `vklass_report_absence_period` (`vklass.write`)
 - `vklass_list_weekly_letters`, `vklass_get_weekly_letter`
 - `vklass_list_news`, `vklass_get_news_article`
 - `vklass_list_calendar`, `vklass_list_assignments`, `vklass_list_care_schedule`

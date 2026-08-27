@@ -43,6 +43,7 @@ async def test_mcp_oauth_discovery_and_subject_token(tmp_path: Path) -> None:
             auth_metadata = await client.get("/.well-known/oauth-authorization-server")
             assert auth_metadata.status_code == 200
             assert auth_metadata.json()["registration_endpoint"].endswith("/register")
+            assert auth_metadata.json()["scopes_supported"] == ["vklass.read", "vklass.write"]
             assert "none" in auth_metadata.json()["token_endpoint_auth_methods_supported"]
             assert "none" in auth_metadata.json()["revocation_endpoint_auth_methods_supported"]
 
@@ -75,6 +76,30 @@ async def test_mcp_oauth_discovery_and_subject_token(tmp_path: Path) -> None:
             )
             assert registration.status_code == 201
             client_id = registration.json()["client_id"]
+
+            write_registration = await client.post(
+                "/register",
+                json={
+                    "redirect_uris": ["http://127.0.0.1:8766/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "scope": "vklass.read vklass.write",
+                },
+            )
+            assert write_registration.status_code == 201
+
+            default_registration = await client.post(
+                "/register",
+                json={
+                    "redirect_uris": ["http://127.0.0.1:8767/callback"],
+                    "token_endpoint_auth_method": "none",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                },
+            )
+            assert default_registration.status_code == 201
+            assert default_registration.json()["scope"] == "vklass.read"
 
             verifier = "a" * 64
             missing_resource = await client.get(
@@ -162,6 +187,11 @@ async def test_mcp_oauth_discovery_and_subject_token(tmp_path: Path) -> None:
                 await session.initialize()
                 result = await session.call_tool("vklass_capabilities", {})
                 assert not result.isError
+                denied_write = await session.call_tool(
+                    "vklass_report_absence_today", {"child": "12345", "confirm": True}
+                )
+                assert denied_write.isError
+                assert "vklass.write" in str(denied_write.content)
 
             refreshed_response = await client.post(
                 "/token",
