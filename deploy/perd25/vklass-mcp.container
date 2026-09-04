@@ -8,16 +8,16 @@ Image=localhost/vklass-mcp:latest
 Pull=never
 ContainerName=vklass-mcp
 LogDriver=journald
-Network=folksaga.network
-NetworkAlias=vklass-mcp
+# Only the host-level perapp-edge proxy can reach this HTTP endpoint.
+PublishPort=127.0.0.1:8787:8000
 Environment=VKLASS_PUBLIC_BASE_URL=https://vklass.perapp.dev
-Environment=VKLASS_ALLOWED_HOSTS=vklass.perapp.dev,vklass-mcp:*,localhost:*,127.0.0.1:*
+Environment=VKLASS_ALLOWED_HOSTS=vklass.perapp.dev,localhost:*,127.0.0.1:*
 Environment=VKLASS_DATA_DIR=/data
 Environment=VKLASS_STATE_KEY_FILE=/run/secrets/state-key
 Environment=VKLASS_ORGANISATION_ID=190
 Environment=VKLASS_LOG_LEVEL=INFO
 Secret=vklass-mcp-state-key,type=mount,target=state-key,uid=10001,gid=10001,mode=0400
-Volume=/srv/folksaga/data/vklass-mcp:/data
+Volume=%h/.local/share/vklass-mcp:/data:Z
 User=10001
 Group=10001
 UserNS=keep-id:uid=10001,gid=10001
@@ -34,7 +34,6 @@ HealthStartPeriod=5s
 HealthOnFailure=kill
 
 [Service]
-Environment=CONTAINERS_STORAGE_CONF=/etc/folksaga/storage.conf
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=180

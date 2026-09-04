@@ -151,22 +151,24 @@ For the user service to survive logout:
 loginctl enable-linger "$USER"
 ```
 
-### Public deployment through the Folksaga edge
+### Production deployment on `perd25`
 
-`deploy/folksaga/` targets the existing `folksaga` rootless Podman account on `perd.local`. It
-transfers the locally built image, installs a hardened Quadlet on the private `folksaga` network,
-creates a backed-up state key and starts the service without publishing another host port:
+`deploy/perd25/` builds locally, transfers the image through SSH, installs a hardened rootless
+Quadlet in the service account's default Podman store, and publishes HTTP only on
+`127.0.0.1:8787`. The independent [`perapp-edge`](https://gitlab.com/perapp/perapp-edge) Caddy service owns public TLS and
+routes `https://vklass.perapp.dev` to that loopback port.
 
 ```bash
 make build
-./deploy/folksaga/deploy.sh
+./deploy/perd25/deploy.sh
 ```
 
-The tracked Folksaga Caddy configuration proxies `https://vklass.perapp.dev` directly to
-`vklass-mcp:8000` and obtains its public certificate through the existing ports 80/443. DNS already
-resolves that hostname through `perapp.dev`. Back up both `/srv/folksaga/data/vklass-mcp/` and
-`/srv/folksaga/secrets/vklass-mcp-state-key`; losing the key disconnects every user and makes encrypted
-sessions and OAuth client registrations unreadable.
+The first deployment stops the service before copying its SQLite state and state key from the legacy
+`/srv/folksaga` paths. Those originals are deliberately retained for rollback. The public OAuth
+issuer does not change, so the migration does not itself require clients to authorize again.
+
+Back up `~/.local/share/vklass-mcp/` together with `~/.config/vklass-mcp/state-key`; losing the key
+disconnects every user and makes encrypted sessions and OAuth client registrations unreadable.
 
 ## Operations
 
