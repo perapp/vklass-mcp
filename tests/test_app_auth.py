@@ -18,7 +18,9 @@ def _challenge(verifier: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_mcp_oauth_discovery_and_subject_token(tmp_path: Path) -> None:
+async def test_mcp_oauth_discovery_and_subject_token(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     settings = Settings(
         data_dir=tmp_path,
         public_base_url="http://127.0.0.1:8000",
@@ -184,7 +186,25 @@ async def test_mcp_oauth_discovery_and_subject_token(tmp_path: Path) -> None:
                 ),
                 ClientSession(read_stream, write_stream) as session,
             ):
-                await session.initialize()
+                initialized = await session.initialize()
+                assert initialized.instructions is not None
+                assert "always call the relevant list/get tool" in initialized.instructions
+                tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+                sync_description = tools["vklass_sync_now"].description or ""
+                care_description = tools["vklass_list_care_schedule"].description or ""
+                assert "returns status/counts, not records" in sync_description
+                assert "Monday-to-Sunday" in care_description
+                care_schema = tools["vklass_list_care_schedule"].inputSchema
+                assert "Inclusive start date" in care_schema["properties"]["start"]["description"]
+                assert "Inclusive end date" in care_schema["properties"]["end"]["description"]
+                invalid = await session.call_tool("vklass_list_care_schedule", {"limit": 0})
+                assert invalid.isError
+                assert any(
+                    "MCP tool call failed name=vklass_list_care_schedule " in record.message
+                    and "argument_keys=limit" in record.message
+                    and "error=ToolError" in record.message
+                    for record in caplog.records
+                )
                 result = await session.call_tool("vklass_capabilities", {})
                 assert not result.isError
                 denied_write = await session.call_tool(

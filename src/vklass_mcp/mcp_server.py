@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from time import monotonic
+from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
 from dateutil import parser as date_parser
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from vklass_mcp.registry import UserRegistry
 from vklass_mcp.service import CAPABILITIES, VklassService
+
+_LOG = logging.getLogger(__name__)
 
 _READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
@@ -63,7 +68,12 @@ def register_tools(mcp: FastMCP[Any], registry: UserRegistry) -> None:
 
     @mcp.tool(annotations=_LIVE_READ)
     async def vklass_sync_now() -> dict[str, Any]:
-        """Read current data from Vklass and refresh the local cache."""
+        """Refresh Vklass caches only; returns status/counts, not records.
+
+        Never use this result alone to answer a question about schedules, events, news,
+        assignments, or other Vklass content. After synchronization, always call the
+        relevant ``vklass_list_*`` or ``vklass_get_*`` tool to retrieve the records.
+        """
 
         service = await _current_service(registry)
         return await service.sync_all()
@@ -226,26 +236,74 @@ def register_tools(mcp: FastMCP[Any], registry: UserRegistry) -> None:
 
     @mcp.tool(annotations=_READ_ONLY)
     async def vklass_list_care_schedule(
-        child: str | None = None,
-        start: str | None = None,
-        end: str | None = None,
-        limit: int = 200,
+        child: Annotated[
+            str | None,
+            Field(description="Optional child name/alias; omit to include all own children."),
+        ] = None,
+        start: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Inclusive start date as YYYY-MM-DD. For an ISO calendar week, pass "
+                    "that week's Monday. Defaults to today in Europe/Stockholm."
+                )
+            ),
+        ] = None,
+        end: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Inclusive end date as YYYY-MM-DD. For an ISO calendar week, pass "
+                    "that week's Sunday. Defaults to 14 days after today."
+                )
+            ),
+        ] = None,
+        limit: Annotated[
+            int,
+            Field(ge=1, le=500, description="Maximum number of schedule-day records."),
+        ] = 200,
     ) -> list[dict[str, Any]]:
-        """List cached omsorgsschema with planned care and actual drop-off/pick-up times."""
+        """Retrieve omsorgsschema/care/fritids schedule records for a date range.
 
-        service = await _current_service(registry)
-        child_id = await _resolve_child(service, child)
-        local_today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
-        start_at = _normalize_date(start or local_today.isoformat())
-        end_at = _normalize_date(
-            end or (local_today + timedelta(days=14)).isoformat(), end_of_day=True
-        )
-        records = await service.store.query_records(
-            kinds=["care_schedule"],
-            child_id=child_id,
-            start_at=start_at,
-            end_at=end_at,
-            limit=limit,
+        Use this tool for planned care hours, drop-off/pick-up, leave, closure, holiday,
+        and calendar-week questions. Convert a requested ISO week to its inclusive
+        Monday-to-Sunday dates. If freshness is requested, call ``vklass_sync_now`` first,
+        then always call this tool; synchronization itself does not return schedule data.
+        Do not substitute the school-calendar tool for omsorgsschema.
+        """
+
+        started = monotonic()
+        try:
+            service = await _current_service(registry)
+            child_id = await _resolve_child(service, child)
+            local_today = datetime.now(ZoneInfo("Europe/Stockholm")).date()
+            start_at = _normalize_date(start or local_today.isoformat())
+            end_at = _normalize_date(
+                end or (local_today + timedelta(days=14)).isoformat(), end_of_day=True
+            )
+            records = await service.store.query_records(
+                kinds=["care_schedule"],
+                child_id=child_id,
+                start_at=start_at,
+                end_at=end_at,
+                limit=limit,
+            )
+        except Exception as error:
+            _LOG.warning(
+                "care schedule query failed error=%s duration_ms=%d",
+                type(error).__name__,
+                round((monotonic() - started) * 1000),
+            )
+            raise
+        _LOG.info(
+            "care schedule query start=%s end=%s child_filtered=%s limit=%d records=%d "
+            "duration_ms=%d",
+            start_at,
+            end_at,
+            child_id is not None,
+            limit,
+            len(records),
+            round((monotonic() - started) * 1000),
         )
         return [_public_record(record, preview=False) for record in records]
 
