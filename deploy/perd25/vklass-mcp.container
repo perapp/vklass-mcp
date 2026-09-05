@@ -8,8 +8,8 @@ Image=localhost/vklass-mcp:latest
 Pull=never
 ContainerName=vklass-mcp
 LogDriver=journald
-# Only the host-level perapp-edge proxy can reach this HTTP endpoint.
-PublishPort=127.0.0.1:8787:8000
+Network=perapp.network
+NetworkAlias=vklass-mcp
 Environment=VKLASS_PUBLIC_BASE_URL=https://vklass.perapp.dev
 Environment=VKLASS_ALLOWED_HOSTS=vklass.perapp.dev,localhost:*,127.0.0.1:*
 Environment=VKLASS_DATA_DIR=/data

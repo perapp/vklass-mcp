@@ -154,9 +154,10 @@ loginctl enable-linger "$USER"
 ### Production deployment on `perd25`
 
 `deploy/perd25/` builds locally, transfers the image through SSH to the dedicated `perapp` account,
-installs a hardened Quadlet in that account's rootless Podman store, and publishes HTTP only on
-`127.0.0.1:8787`. The independent [`perapp-edge`](https://gitlab.com/perapp/perapp-edge) Caddy service owns public TLS and
-routes `https://vklass.perapp.dev` to that loopback port.
+installs a hardened Quadlet in that account's rootless Podman store, and attaches it only to the
+private `perapp` network without publishing a host port. The independent
+[`perapp-edge`](https://gitlab.com/perapp/perapp-edge) Caddy service owns public TLS and routes
+`https://vklass.perapp.dev` to the container alias.
 
 ```bash
 make build

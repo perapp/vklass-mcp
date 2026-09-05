@@ -78,11 +78,10 @@ activated=1
 systemctl --user restart vklass-mcp.service
 systemctl --user is-active --quiet vklass-mcp.service
 for _ in $(seq 1 30); do
-    if podman healthcheck run vklass-mcp >/dev/null 2>&1 \
-            && curl -fsS http://127.0.0.1:8787/healthz >/dev/null; then
+    if podman healthcheck run vklass-mcp >/dev/null 2>&1; then
         trap - EXIT
         rm -f "$backup_unit" "$staged_unit"
-        printf 'Vklass MCP is healthy on loopback for perapp-edge.\n'
+        printf 'Vklass MCP is healthy on the private perapp network.\n'
         exit 0
     fi
     sleep 2
