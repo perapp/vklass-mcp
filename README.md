@@ -153,8 +153,8 @@ loginctl enable-linger "$USER"
 
 ### Production deployment on `perd25`
 
-`deploy/perd25/` builds locally, transfers the image through SSH, installs a hardened rootless
-Quadlet in the service account's default Podman store, and publishes HTTP only on
+`deploy/perd25/` builds locally, transfers the image through SSH to the dedicated `perapp` account,
+installs a hardened Quadlet in that account's rootless Podman store, and publishes HTTP only on
 `127.0.0.1:8787`. The independent [`perapp-edge`](https://gitlab.com/perapp/perapp-edge) Caddy service owns public TLS and
 routes `https://vklass.perapp.dev` to that loopback port.
 
@@ -163,9 +163,9 @@ make build
 ./deploy/perd25/deploy.sh
 ```
 
-The first deployment stops the service before copying its SQLite state and state key from the legacy
-`/srv/folksaga` paths. Those originals are deliberately retained for rollback. The public OAuth
-issuer does not change, so the migration does not itself require clients to authorize again.
+Set `VKLASS_DEPLOY_ACTIVATE=0` to transfer the image and install the Quadlet without starting the
+service during a coordinated migration. The public OAuth issuer is independent of the service
+account and internal port.
 
 Back up `~/.local/share/vklass-mcp/` together with `~/.config/vklass-mcp/state-key`; losing the key
 disconnects every user and makes encrypted sessions and OAuth client registrations unreadable.
